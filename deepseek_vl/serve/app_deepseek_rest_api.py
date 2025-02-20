@@ -1,23 +1,5 @@
 # Copyright (c) 2023-2024 DeepSeek.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy of
-# this software and associated documentation files (the "Software"), to deal in
-# the Software without restriction, including without limitation the rights to
-# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-# the Software, and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-# -*- coding:utf-8 -*-
+# ... (保留原始的版权声明和导入语句) ...
 
 import base64
 from io import BytesIO
@@ -43,6 +25,17 @@ from deepseek_vl.serve.inference import (
 )
 from deepseek_vl.utils.conversation import SeparatorStyle
 
+# 新增：导入 FastAPI 相关库
+from fastapi import FastAPI, Form, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Union
+from PIL import Image
+import signal
+import sys
+import json
+from datetime import datetime
 
 def load_models():
     models = {
@@ -500,16 +493,273 @@ def build_demo(MODELS):
 
     return demo
 
+# ------------------------ FastAPI 部分 ------------------------
+
+app = FastAPI()
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有方法
+    allow_headers=["*"],  # 允许所有头部
+)
+
+# 定义请求体模型 (Pydantic 模型)
+class ChatRequest(BaseModel):
+    text: str
+    image_path: Optional[str] = None
+    history: List[List[Union[str, tuple]]] = []  # 允许字符串或包含图片路径的元组
+    top_p: float = 0.95
+    temperature: float = 0.1
+    repetition_penalty: float = 1.1
+    max_length_tokens: int = 2048
+    max_context_length_tokens: int = 4096
+    model_name: str = MODELS[0]
+
+# 定义响应体模型
+class ChatResponse(BaseModel):
+    response: str
+    history: List[List[Union[str, tuple]]]
+
+def convert_image_to_base64(image: Image.Image) -> str:
+    """将 PIL Image 对象转换为 Base64 字符串"""
+    buffered = BytesIO()
+    image.save(buffered, format="JPEG")  # 或者 "PNG"，取决于你想要的格式
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return img_str
+
+
+# 创建 API 路由
+@app.post("/chat")
+async def chat_api(request: ChatRequest):
+    """
+    Chat API endpoint.
+
+    Args:
+        request: The request body containing text, image_path, and other parameters.
+
+    Returns:
+        ChatResponse: The response containing the generated text and updated history.
+    """
+    filePath = "C:\\Users\\Administrator\\Code\\video-finder\\public\\images\\"
+    print(filePath + request.image_path)
+    try:
+        tokenizer, vl_gpt, vl_chat_processor = models[request.model_name]
+
+        if request.text == "":
+            raise HTTPException(status_code=400, detail="Empty context.")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No Model Found")
+
+    # 处理图像（如果提供了 image_path）
+    if request.image_path:
+         try:
+            with open(filePath + request.image_path, "rb") as image_file:
+                image =  Image.open(image_file).convert("RGB") # 加载并转换为 PIL.Image
+         except FileNotFoundError:
+            raise HTTPException(status_code=400, detail="Image file not found.")
+         except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+    else:
+        image = None
+
+    # 转换 Gradio 历史格式为 DeepSeek VL 格式
+    history = request.history
+    conversation = generate_prompt_with_history(
+        request.text,
+        image,
+        history,
+        vl_chat_processor,
+        tokenizer,
+        max_length=request.max_context_length_tokens,
+    )
+    if conversation is None:  # 历史记录过长
+         raise HTTPException(status_code=400, detail="Context exceeds maximum length.")
+    prompts = convert_conversation_to_prompts(conversation)
+
+    stop_words = conversation.stop_str
+
+    full_response = ""
+    with torch.no_grad():
+        for x in deepseek_generate(
+            prompts=prompts,
+            vl_gpt=vl_gpt,
+            vl_chat_processor=vl_chat_processor,
+            tokenizer=tokenizer,
+            stop_words=stop_words,
+            max_length=request.max_length_tokens,
+            temperature=request.temperature,
+            repetition_penalty=request.repetition_penalty,
+            top_p=request.top_p,
+        ):
+            full_response += x
+
+    response = strip_stop_words(full_response, stop_words)
+    conversation.update_last_message(response)
+    history = to_gradio_history(conversation) # 更新后的历史记录
+
+    # 在返回之前，将 history 中的 PIL Image 对象转换为 Base64 字符串
+    processed_history = []
+    for role, message in history:
+        if isinstance(message, tuple):  # 如果是 (text, image) 元组
+            text, img = message
+            if isinstance(img, Image.Image):
+                img_b64 = convert_image_to_base64(img)
+                processed_history.append([role, (text, img_b64)])  # 存储 Base64 字符串
+            else:
+                processed_history.append([role, message]) # 如果img已经是字符串(例如文件路径),则直接添加
+        else:
+            processed_history.append([role, message])
+
+    torch.cuda.empty_cache()
+    return ChatResponse(response=response, history=[])
+
+@app.post("/chat-stream")
+async def chat_api_stream(request: ChatRequest):
+    """
+    Chat API endpoint with streaming response.
+    """
+    file_path = "C:\\Users\\Administrator\\Code\\video-finder\\public\\images\\"
+
+    try:
+        tokenizer, vl_gpt, vl_chat_processor = models[request.model_name]
+        if request.text == "":
+            raise HTTPException(status_code=400, detail="Empty context.")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No Model Found")
+
+    # 图像处理：如果提供了 image_path，则加载图像；否则，image 为 None
+    if request.image_path:
+        try:
+            with open(file_path + request.image_path, "rb") as image_file:
+                image = Image.open(image_file).convert("RGB")
+        except FileNotFoundError:
+            raise HTTPException(status_code=400, detail="Image file not found.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+    else:
+        image = None
+
+    async def generate():
+        nonlocal image, tokenizer, vl_gpt, vl_chat_processor, request  # 引用外部变量
+        
+        # 历史消息的处理
+        history = request.history
+        conversation = generate_prompt_with_history(
+            request.text,
+            image,
+            history,
+            vl_chat_processor,
+            tokenizer,
+            max_length=request.max_context_length_tokens,
+        )
+        if conversation is None:
+            yield "data: [ERROR]\n\n"  # 使用 SSE 格式发送错误
+            return
+
+        prompts = convert_conversation_to_prompts(conversation)
+        stop_words = conversation.stop_str
+        full_response = ""
+
+        with torch.no_grad():
+            for x in deepseek_generate(
+                prompts=prompts,
+                vl_gpt=vl_gpt,
+                vl_chat_processor=vl_chat_processor,
+                tokenizer=tokenizer,
+                stop_words=stop_words,
+                max_length=request.max_length_tokens,
+                temperature=request.temperature,
+                repetition_penalty=request.repetition_penalty,
+                top_p=request.top_p,
+            ):
+                full_response += x
+                print(x)
+                response_chunk = strip_stop_words(x, stop_words)  # 移除可能的停止词
+                
+                # 构建 JSON 响应
+                json_response = {
+                    "model": request.model_name,
+                    "created_at": datetime.utcnow().isoformat() + "Z",  # 使用 UTC 时间
+                    "message": {"role": "assistant", "content": response_chunk},
+                    "done": False,
+                }
+                yield json.dumps(json_response) + "\n" #添加换行符
+        
+        response = strip_stop_words(full_response, stop_words)
+        conversation.update_last_message(response)
+        history = to_gradio_history(conversation)
+        
+        # 清理 CUDA 缓存
+        torch.cuda.empty_cache()
+
+        # 发送结束标记（可选，但建议）
+        final_json_response = {
+            "model": request.model_name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "message": {"role": "assistant", "content": response},
+            "done": True,
+        }
+        yield json.dumps(final_json_response)
+
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+# -------------------- 启动 Gradio 和 FastAPI --------------------
 
 if __name__ == "__main__":
+    import uvicorn
+
     demo = build_demo(MODELS)
     demo.title = "DeepSeek-VL Chatbot"
 
     reload_javascript()
-    demo.queue(concurrency_count=CONCURRENT_COUNT).launch(
-        share=False,
-        favicon_path="deepseek_vl/serve/assets/favicon.ico",
-        inbrowser=False,
-        server_name="0.0.0.0",
-        server_port=8122,
-    )
+
+    # 使用 uvicorn 同时启动 FastAPI 和 Gradio
+    # 注意：这里需要在一个单独的线程中启动 Gradio
+    import threading
+
+    gradio_thread = None  # 全局变量，用于引用 Gradio 线程
+    server_running = True #标志服务器是否在运行
+
+    def run_gradio():
+        global server_running # 声明使用全局变量
+        demo.queue(concurrency_count=CONCURRENT_COUNT).launch(
+            share=False,
+            favicon_path="deepseek_vl/serve/assets/favicon.ico",
+            inbrowser=False,  # 在生产环境中，通常不需要在浏览器中打开
+            server_name="0.0.0.0",
+            server_port=8122,
+        )
+        server_running = False #Gradio 停止后设置标志
+
+    def signal_handler(sig, frame):
+        """处理 SIGINT 信号 (Ctrl+C)"""
+        global gradio_thread
+        global server_running
+        print("\n正在停止服务器...")
+        server_running = False  # 设置标志，以便 Gradio 线程可以退出
+
+        if gradio_thread and gradio_thread.is_alive():
+            try:
+                # 尝试关闭 Gradio 服务器。  这可能需要一些时间。
+                demo.close()  # 显式关闭 Gradio 应用
+            except Exception as e:
+                print(f"关闭 Gradio 时出错: {e}")
+            gradio_thread.join(timeout=5) # 等待线程结束,设置超时
+            if gradio_thread.is_alive():
+                print("警告：Gradio 线程未能正常终止。")
+
+        print("服务器已停止。")
+        sys.exit(0) # 确保进程退出
+
+    # 注册信号处理程序
+    signal.signal(signal.SIGINT, signal_handler)
+
+    gradio_thread = threading.Thread(target=run_gradio, daemon=True)  # 设置为守护线程
+    gradio_thread.start()
+
+     # 启动 FastAPI
+    uvicorn.run(app, host="0.0.0.0", port=8000)
